@@ -9,8 +9,9 @@ class AirlineFlowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.svc = AirlineRecoveryService(Path(self.tmp.name) / "test.db")
         base = utcnow() + timedelta(days=1)
-        self.svc.seed_airport("ops", "ops_manager", {"code": "AAA", "country": "CN", "curfew_start": "23:00", "curfew_end": "05:00"})
-        self.svc.seed_airport("ops", "ops_manager", {"code": "BBB", "country": "CN", "curfew_start": "23:00", "curfew_end": "05:00"})
+        # AAA/BBB 用明确的 Asia/Shanghai 时区；宵禁只留 23:59-00:00 一分钟窗口，保证测试不受运行时刻影响
+        self.svc.seed_airport("ops", "ops_manager", {"code": "AAA", "country": "CN", "timezone": "Asia/Shanghai", "curfew_start": "23:59", "curfew_end": "00:00"})
+        self.svc.seed_airport("ops", "ops_manager", {"code": "BBB", "country": "CN", "timezone": "Asia/Shanghai", "curfew_start": "23:59", "curfew_end": "00:00"})
         self.svc.seed_aircraft("ops", "ops_manager", {"id": "AC1", "model": "A320", "maintenance_due": iso(base + timedelta(days=5))})
         self.svc.seed_aircraft("ops", "ops_manager", {"id": "AC2", "model": "A320", "maintenance_due": iso(base + timedelta(days=5))})
         self.svc.seed_crew("ops", "ops_manager", {"id": "CR1", "name": "甲组", "base": "AAA", "duty_start": iso(base - timedelta(hours=2)), "max_duty_minutes": 720})

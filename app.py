@@ -5,16 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
+import threading
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
+# 历史数据没有时区列，迁移时统一补这个默认区
+DEFAULT_TIMEZONE = (os.environ.get("AIRLINE_DEFAULT_TZ", "UTC").strip() or "UTC")
 
 
 class ApiError(Exception):
@@ -52,16 +58,73 @@ def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datet
     return a_start < b_end and b_start < a_end
 
 
+def get_zone(name: str) -> ZoneInfo:
+    """校验 IANA 时区名（如 Asia/Shanghai、Europe/London）。"""
+    name = (name or "").strip()
+    if not name or len(name) > 64 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_+\-/:]*", name) or ".." in name:
+        raise ApiError(400, "invalid_timezone", f"时区标识无效: {name}")
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+        raise ApiError(400, "invalid_timezone", f"未知 IANA 时区: {name}") from exc
+
+
+def to_local(moment: datetime, zone: ZoneInfo) -> datetime:
+    """UTC 时刻 -> 当地挂钟时间（携带该刻实际偏移，含 DST）。"""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(zone)
+
+
+def wall_kind(wall: datetime, zone: ZoneInfo) -> str:
+    """判断当地挂钟时间的类型：normal / gap（夏令时空档）/ repeated（重复小时）。"""
+    first = wall.replace(fold=0).utcoffset()
+    second = wall.replace(fold=1).utcoffset()
+    if first == second:
+        return "normal"
+    if second - first > timedelta(0):
+        return "gap"  # 春季跳表后不存在的小时
+    return "repeated"  # 秋季回表重复出现的小时
+
+
+def localize(wall: datetime, zone: ZoneInfo) -> tuple[datetime, str]:
+    """把没有时区的当地挂钟按固定口径落到 UTC：
+    gap（空档）：按 PEP 495 fold=0 顺延到跳表之后；
+    repeated（重复小时）：取第一次出现（夏令时偏移，fold=0）。
+    返回（当地 datetime，kind）。
+    """
+    aware = wall.replace(tzinfo=zone)
+    kind = wall_kind(aware, zone)
+    # fold=0：空档时 utcoffset 取跳表前偏移，相减后正好落在空档之后；重复时取夏令时那次
+    return aware, kind
+
+
+def local_str(wall: datetime) -> str:
+    return wall.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+
+
+def in_curfew(local_clock: time, curfew_start: time, curfew_end: time) -> bool:
+    """宵禁按当地挂钟时刻判定；start==end 视为全天宵禁，空宵禁窗口不限制。"""
+    if curfew_start == curfew_end:
+        return True
+    if curfew_start > curfew_end:  # 跨午夜，如 23:00–05:00
+        return local_clock >= curfew_start or local_clock < curfew_end
+    return curfew_start <= local_clock < curfew_end
+
+
 class Repository:
     def __init__(self, db_path: str | Path):
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self._write_lock = threading.Lock()
         self._init()
 
     @contextmanager
     def tx(self):
+        # 单连接多线程下串行化写事务，使 BEGIN IMMEDIATE 的首写获胜语义在进程内成立
+        self._write_lock.acquire()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield self.conn
@@ -69,11 +132,19 @@ class Repository:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+        finally:
+            self._write_lock.release()
+
+    def _columns(self, table: str) -> set[str]:
+        return {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def _init(self) -> None:
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS airports(code TEXT PRIMARY KEY, country TEXT NOT NULL, curfew_start TEXT NOT NULL, curfew_end TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS airports(
+                code TEXT PRIMARY KEY, country TEXT NOT NULL, timezone TEXT NOT NULL DEFAULT 'UTC',
+                curfew_start TEXT NOT NULL, curfew_end TEXT NOT NULL,
+                tz_version INTEGER NOT NULL DEFAULT 0, tz_updated_at TEXT, tz_updated_by TEXT);
             CREATE TABLE IF NOT EXISTS aircraft(id TEXT PRIMARY KEY, model TEXT NOT NULL, maintenance_due TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active');
             CREATE TABLE IF NOT EXISTS crew(id TEXT PRIMARY KEY, name TEXT NOT NULL, base TEXT NOT NULL, duty_start TEXT NOT NULL, max_duty_minutes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active');
             CREATE TABLE IF NOT EXISTS permits(id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, destination TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, curfew_exempt INTEGER NOT NULL DEFAULT 0, UNIQUE(origin,destination,valid_from,valid_to));
@@ -87,6 +158,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS recovery_plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, disruption_id INTEGER NOT NULL REFERENCES disruptions(id), name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, score_json TEXT, metrics_json TEXT,
+                conclusion_status TEXT, timezone_snapshot_json TEXT,
                 created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT
             );
             CREATE TABLE IF NOT EXISTS assignments(
@@ -96,8 +168,43 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
             """
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """版本化迁移：每步幂等并记录在 schema_migrations。
+        老库的机场数据缺时区，补默认区 DEFAULT_TIMEZONE；中途失败只留下已加好的列，
+        再次启动会跳过已完成的列并补完剩余部分，然后才记版本，可安全重试。"""
+        migrations = [
+            (1, "airports", [
+                f"ALTER TABLE airports ADD COLUMN timezone TEXT NOT NULL DEFAULT '{DEFAULT_TIMEZONE}'",
+                "ALTER TABLE airports ADD COLUMN tz_version INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE airports ADD COLUMN tz_updated_at TEXT",
+                "ALTER TABLE airports ADD COLUMN tz_updated_by TEXT",
+            ]),
+            (2, "recovery_plans", [
+                "ALTER TABLE recovery_plans ADD COLUMN conclusion_status TEXT",
+                "ALTER TABLE recovery_plans ADD COLUMN timezone_snapshot_json TEXT",
+            ]),
+        ]
+        applied = {r["version"] for r in self.conn.execute("SELECT version FROM schema_migrations")}
+        for version, table, statements in migrations:
+            if version in applied:
+                continue
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._columns(table)
+                for stmt in statements:
+                    column = stmt.split("ADD COLUMN", 1)[1].split()[0]
+                    if column not in existing:
+                        self.conn.execute(stmt)
+                self.conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (version, iso()))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -129,9 +236,110 @@ class AirlineRecoveryService:
             raise ApiError(400, "missing_fields", "code 和 country 必填")
         start = str(body.get("curfew_start", "23:00")); end = str(body.get("curfew_end", "06:00"))
         parse_clock(start); parse_clock(end)
+        tz_name = str(body.get("timezone", DEFAULT_TIMEZONE) or DEFAULT_TIMEZONE).strip()
+        get_zone(tz_name)  # 校验 IANA 时区
         with self.repo.tx() as conn:
-            conn.execute("INSERT OR REPLACE INTO airports(code,country,curfew_start,curfew_end) VALUES(?,?,?,?)", (code, country, start, end))
+            # 已存在的机场：改宵禁/国家不动其时区；时区只在首次创建时写入，避免覆盖别人的更新
+            conn.execute("""INSERT INTO airports(code,country,timezone,curfew_start,curfew_end) VALUES(?,?,?,?,?)
+                            ON CONFLICT(code) DO UPDATE SET
+                              country=excluded.country, curfew_start=excluded.curfew_start, curfew_end=excluded.curfew_end""",
+                         (code, country, tz_name, start, end))
             return dict(conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone())
+
+    def update_airport_timezone(self, actor: str, role: str, code: str, body: dict[str, Any]) -> dict[str, Any]:
+        """两人同时提交同一机场时区时，只有先拿到写事务（先到）的一方写入；
+        后到者凭 expected_tz_version 得到 409。"""
+        if role != "ops_manager":
+            raise ApiError(403, "timezone_forbidden", "只有运行经理可以修改机场时区")
+        code = code.upper().strip()
+        tz_name = str(body.get("timezone", "")).strip()
+        expected = body.get("expected_tz_version")
+        if not isinstance(expected, int):
+            raise ApiError(400, "version_required", "expected_tz_version 必须是整数")
+        get_zone(tz_name)
+        with self.repo.tx() as conn:
+            airport = conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone()
+            if not airport:
+                raise ApiError(404, "airport_not_found", "机场不存在")
+            if airport["tz_version"] != expected:
+                raise ApiError(409, "timezone_conflict",
+                               "机场时区已被先提交的人更新，请刷新后重试",
+                               {"current_timezone": airport["timezone"], "current_tz_version": airport["tz_version"]})
+            if airport["timezone"] == tz_name:
+                return dict(airport)  # 幂等：相同值不改版本
+            conn.execute("UPDATE airports SET timezone=?,tz_version=tz_version+1,tz_updated_at=?,tz_updated_by=? WHERE code=?",
+                         (tz_name, iso(), actor, code))
+            # 未执行（草稿）方案的旧校验结论失效；已锁定方案不动，按锁定当时的时区快照解释
+            stale = [r["id"] for r in conn.execute(
+                """SELECT p.id FROM recovery_plans p JOIN assignments a ON a.plan_id=p.id JOIN flights f ON f.id=a.flight_id
+                   WHERE p.status='draft' AND (f.origin=? OR f.destination=?)""", (code, code))]
+            if stale:
+                conn.execute("UPDATE recovery_plans SET conclusion_status='stale',score_json=NULL,metrics_json=NULL WHERE id IN (%s)"
+                             % ",".join("?" * len(stale)), stale)
+            for plan_id in stale:
+                Repository.audit(conn, plan_id, actor, role, "timezone_invalidated",
+                                 {"airport": code, "old_timezone": airport["timezone"], "new_timezone": tz_name})
+            Repository.audit(conn, None, actor, role, "airport_timezone_updated",
+                             {"airport": code, "old_timezone": airport["timezone"], "new_timezone": tz_name,
+                              "tz_version": expected + 1, "invalidated_plans": stale})
+            return dict(conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone())
+
+    def _curfew_snapshot(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        """锁定瞬间相关机场的时区与宵禁快照，供锁定方案按当时时区解释。"""
+        snapshot: dict[str, Any] = {}
+        for row in conn.execute("SELECT code,timezone,curfew_start,curfew_end,tz_version FROM airports"):
+            snapshot[row["code"]] = {"timezone": row["timezone"], "curfew_start": row["curfew_start"],
+                                     "curfew_end": row["curfew_end"], "tz_version": row["tz_version"]}
+        return snapshot
+
+    def convert_time(self, body: dict[str, Any]) -> dict[str, Any]:
+        """UTC <-> 当地挂钟换算。固定口径：
+        gap（夏令时空档）顺延到跳表后；repeated（重复小时）取第一次（fold=0）。"""
+        tz_name = str(body.get("timezone", "")).strip()
+        code = str(body.get("airport", "")).upper().strip()
+        with self._readonly() as conn:
+            zone = get_zone(tz_name) if tz_name else None
+            airport = None
+            if code:
+                airport = conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone()
+                if not airport:
+                    raise ApiError(404, "airport_not_found", "机场不存在")
+                zone = get_zone(airport["timezone"])
+        if zone is None:
+            raise ApiError(400, "timezone_required", "必须提供 timezone 或 airport")
+        if body.get("utc") is not None:
+            moment = parse_time(body["utc"])
+            local = to_local(moment, zone)
+            return {"timezone": zone.key, "utc": iso(moment), "local": local_str(local),
+                    "wall_clock": local.strftime("%H:%M"), "dst": bool(local.dst()),
+                    "utc_offset": local.strftime("%z"), "wall_kind": wall_kind(local, zone)}
+        wall_value = body.get("local")
+        if wall_value:
+            try:
+                wall = datetime.fromisoformat(str(wall_value))
+            except ValueError as exc:
+                raise ApiError(400, "invalid_local", f"当地时间格式错误: {wall_value}") from exc
+            if wall.tzinfo is not None:
+                raise ApiError(400, "invalid_local", "local 应为不带偏移的当地挂钟时间")
+            aware, kind = localize(wall, zone)
+            utc_value = aware.astimezone(timezone.utc)
+            if kind == "gap":  # 空档顺延
+                resolved = utc_value.astimezone(zone)
+            else:
+                resolved = aware
+            return {"timezone": zone.key, "local": local_str(resolved), "utc": iso(utc_value),
+                    "dst": bool(resolved.dst()), "utc_offset": resolved.strftime("%z"),
+                    "wall_kind": kind,
+                    "policy": "gap 顺延跳表后" if kind == "gap" else ("重复小时取第一次（fold=0）" if kind == "repeated" else None)}
+        raise ApiError(400, "time_required", "必须提供 utc 或 local")
+
+    @contextmanager
+    def _readonly(self) -> Iterator[sqlite3.Connection]:
+        self.repo._write_lock.acquire()
+        try:
+            yield self.repo.conn
+        finally:
+            self.repo._write_lock.release()
 
     def seed_aircraft(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "ops_manager": raise ApiError(403, "seed_forbidden", "只有运行经理可以维护飞机")
@@ -256,26 +464,36 @@ class AirlineRecoveryService:
             if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能修改")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案已被其他人更新")
             self._insert_assignment(conn, plan_id, body, replace=True)
-            conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+            conn.execute("UPDATE recovery_plans SET revision=revision+1,conclusion_status=NULL,score_json=NULL,metrics_json=NULL WHERE id=?", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
             return self.get_plan(plan_id)
 
     def _validate_plan(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
         if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+        # 已锁定方案按锁定当时的时区/宵禁快照解释；草稿方案按当前机场数据校验
+        snapshot = json.loads(plan["timezone_snapshot_json"]) if plan["timezone_snapshot_json"] else None
         rows = [dict(r) for r in conn.execute("""SELECT a.*, f.flight_no, f.origin, f.destination, f.passenger_count, f.status flight_status
                                                   FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
         if not rows: raise ApiError(409, "empty_plan", "方案没有飞行调整")
         problems: list[dict[str, Any]] = []
         by_aircraft: dict[str, list[dict[str, Any]]] = {}
         by_crew: dict[str, list[dict[str, Any]]] = {}
+        airport_cache: dict[str, sqlite3.Row | dict[str, Any] | None] = {}
+
+        def effective_airport(code: str):
+            if code in airport_cache:
+                return airport_cache[code]
+            airport = snapshot[code] if snapshot and code in snapshot else conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone()
+            airport_cache[code] = airport
+            return airport
         for row in rows:
             if row["status"] == "canceled": continue
             std, sta = parse_time(row["new_std"]), parse_time(row["new_sta"])
             aircraft = conn.execute("SELECT * FROM aircraft WHERE id=?", (row["aircraft_id"],)).fetchone()
             crew = conn.execute("SELECT * FROM crew WHERE id=?", (row["crew_id"],)).fetchone()
-            origin = conn.execute("SELECT * FROM airports WHERE code=?", (row["origin"],)).fetchone()
-            destination = conn.execute("SELECT * FROM airports WHERE code=?", (row["destination"],)).fetchone()
+            origin = effective_airport(row["origin"])
+            destination = effective_airport(row["destination"])
             if not aircraft or aircraft["status"] != "active": problems.append({"assignment_id": row["id"], "code": "aircraft_unavailable"})
             elif parse_time(aircraft["maintenance_due"]) < sta: problems.append({"assignment_id": row["id"], "code": "maintenance_due", "resource": aircraft["id"]})
             if not crew or crew["status"] != "active": problems.append({"assignment_id": row["id"], "code": "crew_unavailable"})
@@ -287,9 +505,12 @@ class AirlineRecoveryService:
                 curfew_start, curfew_end = parse_clock(destination["curfew_start"]), parse_clock(destination["curfew_end"])
                 permit = conn.execute("""SELECT * FROM permits WHERE origin=? AND destination=? AND valid_from<=? AND valid_to>=?""",
                                       (row["origin"], row["destination"], row["new_sta"], row["new_sta"])).fetchone()
-                arrival_clock = sta.timetz().replace(tzinfo=None)
-                inside = arrival_clock >= curfew_start or arrival_clock < curfew_end if curfew_start > curfew_end else curfew_start <= arrival_clock < curfew_end
-                if inside and not (permit and permit["curfew_exempt"]): problems.append({"assignment_id": row["id"], "code": "airport_curfew"})
+                dest_zone = get_zone(destination["timezone"])
+                arrival_local = to_local(sta, dest_zone)  # UTC 到达时刻 -> 目的地当地时间
+                if in_curfew(arrival_local.timetz().replace(tzinfo=None), curfew_start, curfew_end) and not (permit and permit["curfew_exempt"]):
+                    problems.append({"assignment_id": row["id"], "code": "airport_curfew",
+                                     "timezone": destination["timezone"], "arrival_local": local_str(arrival_local),
+                                     "curfew_window": f"{curfew_start.strftime('%H:%M')}-{curfew_end.strftime('%H:%M')} 当地时间"})
                 if row["origin"] != row["destination"] and not permit: problems.append({"assignment_id": row["id"], "code": "route_permit_missing"})
                 elif row["origin"] != row["destination"] and not (parse_time(permit["valid_from"]) <= std <= parse_time(permit["valid_to"])):
                     problems.append({"assignment_id": row["id"], "code": "route_permit_window"})
@@ -306,10 +527,16 @@ class AirlineRecoveryService:
     def validate_plan(self, plan_id: int, actor: str, role: str) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager", "auditor"}: raise ApiError(403, "validate_forbidden", "当前角色不能校验方案")
         with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] == "locked": raise ApiError(409, "plan_locked", "已锁定方案的结论按锁定当时时区解释，不能重新校验")
             problems = self._validate_plan(conn, plan_id)
-            if not problems:
+            if problems:
+                conn.execute("UPDATE recovery_plans SET conclusion_status='invalid',score_json=NULL,metrics_json=NULL WHERE id=?", (plan_id,))
+            else:
                 metrics = self._metrics(conn, plan_id)
-                conn.execute("UPDATE recovery_plans SET metrics_json=?,score_json=? WHERE id=?", (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), plan_id))
+                conn.execute("UPDATE recovery_plans SET conclusion_status='valid',metrics_json=?,score_json=? WHERE id=?",
+                             (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), plan_id))
             return {"valid": not problems, "problems": problems, "plan": self.get_plan(plan_id)}
 
     def _metrics(self, conn: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
@@ -343,8 +570,9 @@ class AirlineRecoveryService:
                 conflicts.extend({"assignment_id": row["id"], "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]} for item in conflicting)
             if conflicts: raise ApiError(409, "locked_resource_conflict", "与已锁定方案存在飞机或机组冲突", conflicts)
             metrics = self._metrics(conn, plan_id)
-            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
-                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
+            snapshot = self._curfew_snapshot(conn)
+            conn.execute("""UPDATE recovery_plans SET status='locked',conclusion_status='valid',timezone_snapshot_json=?,metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
+                         (json.dumps(snapshot, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
             for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)):
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
@@ -382,14 +610,32 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def _plan_airport(self, plan: sqlite3.Row | dict[str, Any], code: str, conn: sqlite3.Connection) -> dict[str, Any] | None:
+        """方案里某机场所用的时区与宵禁：锁定方案取快照，草稿取当前。"""
+        snapshot = json.loads(plan["timezone_snapshot_json"]) if plan["timezone_snapshot_json"] else None
+        if snapshot and code in snapshot:
+            return snapshot[code]
+        row = conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone()
+        return dict(row) if row else None
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
         if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
         assignments = [dict(r) for r in conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
+        for item in assignments:
+            # 页面要显示当地时间：按方案有效时区（锁定=快照，草稿=当前）把 UTC 调整时刻换算出来
+            for side, column, utc_column in (("origin", item["origin"], "new_std"), ("destination", item["destination"], "new_sta")):
+                airport = self._plan_airport(plan, column, conn)
+                if airport:
+                    local = to_local(parse_time(item[utc_column]), get_zone(airport["timezone"]))
+                    item[f"{side}_timezone"] = airport["timezone"]
+                    item[f"{side}_local"] = local_str(local)
+                    item[f"{side}_dst"] = bool(local.dst())
         result = dict(plan)
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
+        result["timezone_snapshot"] = json.loads(plan["timezone_snapshot_json"]) if plan["timezone_snapshot_json"] else None
         result["assignments"] = assignments
         return result
 
@@ -397,20 +643,41 @@ class AirlineRecoveryService:
         plans = []
         for row in self.repo.conn.execute("SELECT id FROM recovery_plans WHERE disruption_id=? ORDER BY id", (disruption_id,)):
             plan = self.get_plan(row["id"])
-            if not plan["score"]:
+            # 以结论状态为准：时区更新后被置 stale 的旧结论必须重新校验，不能当作可用方案
+            if plan["conclusion_status"] == "valid":
+                plan["valid"] = True
+            else:
                 problems = self._validate_plan(self.repo.conn, row["id"])
                 plan["valid"] = not problems
-            else:
-                plan["valid"] = True
             plans.append(plan)
-        plans.sort(key=lambda item: item["score"]["cost_score"] if item["score"] else 10**18)
-        return {"disruption_id": disruption_id, "recommended_plan_id": plans[0]["id"] if plans else None, "plans": plans}
+        plans.sort(key=lambda item: item["score"]["cost_score"] if item["valid"] and item["score"] else 10**18)
+        recommended = next((p["id"] for p in plans if p["valid"]), None)
+        return {"disruption_id": disruption_id, "recommended_plan_id": recommended, "plans": plans}
 
     def state(self) -> dict[str, Any]:
         conn = self.repo.conn
-        flights = [dict(r) for r in conn.execute("SELECT * FROM flights ORDER BY std")]
+        airports = []
+        airport_zones: dict[str, ZoneInfo] = {}
+        for row in conn.execute("SELECT * FROM airports ORDER BY code"):
+            data = dict(row)
+            airport_zones[row["code"]] = get_zone(row["timezone"])
+            airports.append(data)
+        now = utcnow()
+        flights = []
+        for r in conn.execute("SELECT * FROM flights ORDER BY std"):
+            data = dict(r)
+            # 页面显示每个起降点的当地时间
+            for side, code_column, utc_column in (("origin", "origin", "std"), ("destination", "destination", "sta")):
+                zone = airport_zones.get(data[code_column])
+                if zone:
+                    local = to_local(parse_time(data[utc_column]), zone)
+                    data[f"{side}_timezone"] = zone.key
+                    data[f"{side}_local"] = local_str(local)
+            flights.append(data)
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
-        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
+        return {"airports": airports, "flights": flights,
+                "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")],
+                "plans": plans, "server_time": iso(), "server_local": local_str(to_local(now, ZoneInfo(DEFAULT_TIMEZONE)))}
 
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -436,6 +703,10 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
+        if path == "/api/time-convert":
+            query = parse_qs(urlparse(self.path).query)
+            body = {k: v[0] for k, v in query.items()}
+            return 200, self.service.convert_time(body)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
@@ -447,8 +718,11 @@ class Handler(BaseHTTPRequestHandler):
             "/api/flights": lambda: (201, self.service.create_flight(actor, role, body)),
             "/api/disruptions": lambda: (201, self.service.create_disruption(actor, role, body)),
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
+            "/api/time-convert": lambda: (200, self.service.convert_time(body)),
         }
         if path in table: return table[path]()
+        if len(parts) == 4 and parts[:2] == ["api", "airports"] and parts[3] == "timezone":
+            return 200, self.service.update_airport_timezone(actor, role, parts[2], body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             plan_id, action = int(parts[2]), parts[3]
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
