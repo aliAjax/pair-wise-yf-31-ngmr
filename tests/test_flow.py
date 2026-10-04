@@ -1,14 +1,15 @@
 import sys, tempfile, unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import AirlineRecoveryService, ApiError, iso, utcnow
+from app import AirlineRecoveryService, ApiError, iso
 
 
 class AirlineFlowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.svc = AirlineRecoveryService(Path(self.tmp.name) / "test.db")
-        base = utcnow() + timedelta(days=1)
+        # 固定基准时刻，避免用例行为随运行时刻（当地宵禁窗口）漂移
+        base = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
         self.svc.seed_airport("ops", "ops_manager", {"code": "AAA", "country": "CN", "curfew_start": "23:00", "curfew_end": "05:00"})
         self.svc.seed_airport("ops", "ops_manager", {"code": "BBB", "country": "CN", "curfew_start": "23:00", "curfew_end": "05:00"})
         self.svc.seed_aircraft("ops", "ops_manager", {"id": "AC1", "model": "A320", "maintenance_due": iso(base + timedelta(days=5))})

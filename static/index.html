@@ -1,3 +1,26 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}table{border-collapse:collapse;width:100%}th,td{padding:6px 10px;border-bottom:1px solid #e5e7eb;text-align:left;font-size:14px}th{background:#f8fafc}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}.stale{color:#b45309;font-weight:600}.locked{color:#047857;font-weight:600}.utc{color:#6b7280;font-size:12px}</style>
+<h1>航班恢复控制台</h1><p>时刻均显示当地时间（UTC 见小字）。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p>
+<section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section>
+<section><h2>机场与时区</h2><table id="airports"><thead><tr><th>代码</th><th>国家</th><th>宵禁</th><th>时区</th><th>版本</th></tr></thead><tbody></tbody></table></section>
+<section><h2>航班（当地时刻）</h2><table id="flights"><thead><tr><th>航班号</th><th>航线</th><th>起飞当地</th><th>到达当地</th><th>状态</th></tr></thead><tbody></tbody></table></section>
+<section><h2>恢复方案</h2><div id="plans"></div></section>
+<script>
+function fmtLocal(v){return v?v.replace('T',' ').replace(/([+-]\d\d):(\d\d)$/,'$1$2'):'-'}
+async function load(){
+  let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});
+  let s=await x.json();
+  let at=document.querySelector('#airports tbody');at.innerHTML='';
+  for(let a of s.airports||[])at.innerHTML+=`<tr><td>${a.code}</td><td>${a.country}</td><td>${a.curfew_start}-${a.curfew_end}</td><td>${a.timezone}</td><td>${a.timezone_revision}</td></tr>`;
+  let ft=document.querySelector('#flights tbody');ft.innerHTML='';
+  for(let f of s.flights||[])ft.innerHTML+=`<tr><td>${f.flight_no}</td><td>${f.origin}→${f.destination}</td><td>${fmtLocal(f.std_local)}<div class="utc">UTC ${f.std.replace('T',' ').replace('Z','')}</div></td><td>${fmtLocal(f.sta_local)}<div class="utc">UTC ${f.sta.replace('T',' ').replace('Z','')}</div></td><td>${f.status}</td></tr>`;
+  let pd=document.getElementById('plans');pd.innerHTML='';
+  for(let p of s.plans||[]){
+    let rows=(p.assignments||[]).map(a=>`<tr><td>${a.flight_id}</td><td>${a.origin}→${a.destination}</td><td>${fmtLocal(a.new_std_local)}<div class="utc">${a.origin_timezone}</div></td><td>${fmtLocal(a.new_sta_local)}<div class="utc">${a.destination_timezone}</div></td><td>${a.status}</td></tr>`).join('');
+    let tag=p.status==='locked'?'<span class="locked">已锁定（按锁定时区解释）</span>':(p.validation_stale?'<span class="stale">结论待重新校验</span>':'草稿');
+    pd.innerHTML+=`<h3>#${p.id} ${p.name} ${tag}</h3><table><thead><tr><th>航班</th><th>航线</th><th>起飞当地</th><th>到达当地</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  o.textContent=JSON.stringify(s,null,2);
+}
+load();
+</script>

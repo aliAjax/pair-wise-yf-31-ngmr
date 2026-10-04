@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
@@ -48,6 +49,40 @@ def parse_clock(value: str) -> time:
         raise ApiError(400, "invalid_clock", f"时刻格式应为 HH:MM: {value}") from exc
 
 
+DEFAULT_TIMEZONE = "UTC"
+
+
+def airport_tz(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ApiError(400, "invalid_timezone", f"未知时区: {name}") from exc
+
+
+def to_local_iso(value: datetime, tz_name: str) -> str:
+    """Convert an aware UTC datetime to local wall time in the airport's zone."""
+    return value.astimezone(airport_tz(tz_name)).replace(microsecond=0).isoformat()
+
+
+def local_wall_to_utc(wall: datetime, tz_name: str) -> datetime:
+    """Interpret a naive local wall-clock datetime as UTC.
+
+    Fixed DST rule (PEP 495 fold=0): ambiguous times (fall-back, the same wall
+    clock occurs twice) use the first occurrence (daylight offset); nonexistent
+    times (spring-forward gap) shift forward across the gap.
+    """
+    tz = airport_tz(tz_name)
+    if wall.tzinfo is not None:
+        wall = wall.astimezone(tz).replace(tzinfo=None)
+    return wall.replace(tzinfo=tz, fold=0).astimezone(timezone.utc)
+
+
+def local_clock_in_curfew(utc_dt: datetime, tz_name: str, start: time, end: time) -> bool:
+    """Whether the local wall-clock time of a UTC instant falls inside the curfew window."""
+    clock = utc_dt.astimezone(airport_tz(tz_name)).timetz().replace(tzinfo=None)
+    return clock >= start or clock < end if start > end else start <= clock < end
+
+
 def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return a_start < b_end and b_start < a_end
 
@@ -73,7 +108,10 @@ class Repository:
     def _init(self) -> None:
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS airports(code TEXT PRIMARY KEY, country TEXT NOT NULL, curfew_start TEXT NOT NULL, curfew_end TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS airports(
+                code TEXT PRIMARY KEY, country TEXT NOT NULL, curfew_start TEXT NOT NULL, curfew_end TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC', timezone_revision INTEGER NOT NULL DEFAULT 1
+            );
             CREATE TABLE IF NOT EXISTS aircraft(id TEXT PRIMARY KEY, model TEXT NOT NULL, maintenance_due TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active');
             CREATE TABLE IF NOT EXISTS crew(id TEXT PRIMARY KEY, name TEXT NOT NULL, base TEXT NOT NULL, duty_start TEXT NOT NULL, max_duty_minutes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active');
             CREATE TABLE IF NOT EXISTS permits(id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, destination TEXT NOT NULL, valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, curfew_exempt INTEGER NOT NULL DEFAULT 0, UNIQUE(origin,destination,valid_from,valid_to));
@@ -87,6 +125,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS recovery_plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, disruption_id INTEGER NOT NULL REFERENCES disruptions(id), name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, score_json TEXT, metrics_json TEXT,
+                timezone_snapshot_json TEXT,
                 created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT
             );
             CREATE TABLE IF NOT EXISTS assignments(
@@ -98,6 +137,23 @@ class Repository:
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
+        self._migrate()
+
+    def _columns(self, table: str) -> set[str]:
+        return {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial release. Idempotent and retryable:
+        each ALTER is guarded by a column-existence check, so a failure midway can be
+        recovered by re-running initialization."""
+        airport_cols = self._columns("airports")
+        if "timezone" not in airport_cols:
+            self.conn.execute("ALTER TABLE airports ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
+        if "timezone_revision" not in airport_cols:
+            self.conn.execute("ALTER TABLE airports ADD COLUMN timezone_revision INTEGER NOT NULL DEFAULT 1")
+        plan_cols = self._columns("recovery_plans")
+        if "timezone_snapshot_json" not in plan_cols:
+            self.conn.execute("ALTER TABLE recovery_plans ADD COLUMN timezone_snapshot_json TEXT")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -129,8 +185,39 @@ class AirlineRecoveryService:
             raise ApiError(400, "missing_fields", "code 和 country 必填")
         start = str(body.get("curfew_start", "23:00")); end = str(body.get("curfew_end", "06:00"))
         parse_clock(start); parse_clock(end)
+        tz_name = str(body.get("timezone", DEFAULT_TIMEZONE)).strip() or DEFAULT_TIMEZONE
+        airport_tz(tz_name)
         with self.repo.tx() as conn:
-            conn.execute("INSERT OR REPLACE INTO airports(code,country,curfew_start,curfew_end) VALUES(?,?,?,?)", (code, country, start, end))
+            conn.execute("""INSERT INTO airports(code,country,curfew_start,curfew_end,timezone) VALUES(?,?,?,?,?)
+                            ON CONFLICT(code) DO UPDATE SET country=excluded.country,curfew_start=excluded.curfew_start,curfew_end=excluded.curfew_end""",
+                         (code, country, start, end, tz_name))
+            return dict(conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone())
+
+    def update_airport_timezone(self, code: str, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "ops_manager":
+            raise ApiError(403, "seed_forbidden", "只有运行经理可以维护机场数据")
+        tz_name = str(body.get("timezone", "")).strip()
+        if not tz_name:
+            raise ApiError(400, "missing_fields", "timezone 必填")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int):
+            raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        airport_tz(tz_name)
+        code = code.upper().strip()
+        with self.repo.tx() as conn:
+            airport = conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone()
+            if not airport:
+                raise ApiError(404, "airport_not_found", "机场不存在")
+            cur = conn.execute("UPDATE airports SET timezone=?, timezone_revision=timezone_revision+1 WHERE code=? AND timezone_revision=?",
+                               (tz_name, code, expected))
+            if cur.rowcount == 0:
+                raise ApiError(409, "timezone_conflict", "机场时区已被其他人更新，请刷新后重试")
+            # 时区一变，所有未锁定方案此前基于当地时刻得出的校验/评分结论全部失效
+            conn.execute("""UPDATE recovery_plans SET metrics_json=NULL, score_json=NULL WHERE status='draft' AND id IN (
+                                SELECT DISTINCT a.plan_id FROM assignments a JOIN flights f ON f.id=a.flight_id
+                                WHERE f.origin=? OR f.destination=?)""", (code, code))
+            Repository.audit(conn, None, actor, role, "airport_timezone_updated",
+                            {"airport": code, "timezone": tz_name, "expected_revision": expected})
             return dict(conn.execute("SELECT * FROM airports WHERE code=?", (code,)).fetchone())
 
     def seed_aircraft(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -287,8 +374,7 @@ class AirlineRecoveryService:
                 curfew_start, curfew_end = parse_clock(destination["curfew_start"]), parse_clock(destination["curfew_end"])
                 permit = conn.execute("""SELECT * FROM permits WHERE origin=? AND destination=? AND valid_from<=? AND valid_to>=?""",
                                       (row["origin"], row["destination"], row["new_sta"], row["new_sta"])).fetchone()
-                arrival_clock = sta.timetz().replace(tzinfo=None)
-                inside = arrival_clock >= curfew_start or arrival_clock < curfew_end if curfew_start > curfew_end else curfew_start <= arrival_clock < curfew_end
+                inside = local_clock_in_curfew(sta, destination["timezone"], curfew_start, curfew_end)
                 if inside and not (permit and permit["curfew_exempt"]): problems.append({"assignment_id": row["id"], "code": "airport_curfew"})
                 if row["origin"] != row["destination"] and not permit: problems.append({"assignment_id": row["id"], "code": "route_permit_missing"})
                 elif row["origin"] != row["destination"] and not (parse_time(permit["valid_from"]) <= std <= parse_time(permit["valid_to"])):
@@ -343,8 +429,12 @@ class AirlineRecoveryService:
                 conflicts.extend({"assignment_id": row["id"], "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]} for item in conflicting)
             if conflicts: raise ApiError(409, "locked_resource_conflict", "与已锁定方案存在飞机或机组冲突", conflicts)
             metrics = self._metrics(conn, plan_id)
-            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
-                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
+            codes = {code for row in conn.execute("""SELECT DISTINCT f.origin code FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?
+                                                     UNION SELECT DISTINCT f.destination FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?""",
+                                                  (plan_id, plan_id)) for code in row}
+            snapshot = {code: conn.execute("SELECT timezone FROM airports WHERE code=?", (code,)).fetchone()["timezone"] for code in codes}
+            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,timezone_snapshot_json=?,locked_at=?,locked_by=? WHERE id=?""",
+                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), json.dumps(snapshot, ensure_ascii=False), iso(), actor, plan_id))
             for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)):
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
@@ -382,6 +472,22 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def _localize_assignments(self, conn: sqlite3.Connection, plan: sqlite3.Row, assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        snapshot = json.loads(plan["timezone_snapshot_json"]) if plan["timezone_snapshot_json"] else {}
+
+        def tz_for(code: str) -> str:
+            if plan["status"] == "locked" and code in snapshot:
+                return snapshot[code]
+            airport = conn.execute("SELECT timezone FROM airports WHERE code=?", (code,)).fetchone()
+            return airport["timezone"] if airport else DEFAULT_TIMEZONE
+
+        for row in assignments:
+            origin_tz, dest_tz = tz_for(row["origin"]), tz_for(row["destination"])
+            row["origin_timezone"], row["destination_timezone"] = origin_tz, dest_tz
+            row["new_std_local"] = to_local_iso(parse_time(row["new_std"]), origin_tz)
+            row["new_sta_local"] = to_local_iso(parse_time(row["new_sta"]), dest_tz)
+        return assignments
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -390,7 +496,8 @@ class AirlineRecoveryService:
         result = dict(plan)
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
-        result["assignments"] = assignments
+        result["validation_stale"] = plan["status"] != "locked" and plan["score_json"] is None
+        result["assignments"] = self._localize_assignments(conn, plan, assignments)
         return result
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
@@ -409,8 +516,13 @@ class AirlineRecoveryService:
     def state(self) -> dict[str, Any]:
         conn = self.repo.conn
         flights = [dict(r) for r in conn.execute("SELECT * FROM flights ORDER BY std")]
+        tz_by_code = {r["code"]: r["timezone"] for r in conn.execute("SELECT code,timezone FROM airports")}
+        for flight in flights:
+            flight["std_local"] = to_local_iso(parse_time(flight["std"]), tz_by_code.get(flight["origin"], DEFAULT_TIMEZONE))
+            flight["sta_local"] = to_local_iso(parse_time(flight["sta"]), tz_by_code.get(flight["destination"], DEFAULT_TIMEZONE))
         plans = [self.get_plan(r["id"]) for r in conn.execute("SELECT id FROM recovery_plans ORDER BY id DESC LIMIT 20")]
-        return {"flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
+        return {"airports": [dict(r) for r in conn.execute("SELECT code,country,curfew_start,curfew_end,timezone,timezone_revision FROM airports ORDER BY code")],
+                "flights": flights, "disruptions": [dict(r) for r in conn.execute("SELECT * FROM disruptions ORDER BY id DESC")], "plans": plans, "server_time": iso()}
 
 
 def respond(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -449,6 +561,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
         }
         if path in table: return table[path]()
+        if len(parts) == 4 and parts[:2] == ["api", "airports"] and parts[3] == "timezone":
+            return 200, self.service.update_airport_timezone(parts[2], actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             plan_id, action = int(parts[2]), parts[3]
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
